@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ContactStore } from "../src/contacts.js";
-import { OWNER_EMAIL_PRINCIPAL_ID, isReservedHandle, normalizeHandle, normalizePhone, resolvePrincipal } from "../src/principal.js";
+import { OWNER_EMAIL_PRINCIPAL_ID, OWNER_EMAIL_TIER, capTier, isReservedHandle, normalizeHandle, normalizePhone, resolvePrincipal } from "../src/principal.js";
+import { TIER_ORDER } from "../src/types.js";
 import { inbound, tempState, testConfig } from "./helpers.js";
 
 describe("normalizePhone", () => {
@@ -12,6 +13,13 @@ describe("normalizePhone", () => {
     expect(normalizePhone("+44 20 7946 0958")).toBe("+442079460958");
     expect(normalizePhone("")).toBe("");
     expect(normalizePhone("abc")).toBe("");
+  });
+
+  it("never adds +1 to a number that already has a country code", () => {
+    // Ten digits including the country code: Norway, Denmark and Singapore mobiles.
+    expect(normalizePhone("+47 91 23 45 67")).toBe("+4791234567");
+    expect(normalizePhone("+45 21 23 45 67")).toBe("+4521234567");
+    expect(normalizePhone(" +65 9123 4567")).toBe("+6591234567");
   });
 });
 
@@ -33,6 +41,12 @@ describe("resolvePrincipal", () => {
     return store;
   }
 
+  it("does not take a ten-digit international sender for the US owner with the same digits", () => {
+    // The owner is +1 617 555 0100; +61 755 50100 has the same ten digits after its own country code.
+    const p = resolvePrincipal(inbound({ channel: "sms", from: "+6175550100" }), config, contacts());
+    expect(p.kind).not.toBe("owner");
+  });
+
   it("recognises the owner by phone in any formatting and on local channels", () => {
     const c = contacts();
     for (const from of ["+16175550100", "(617) 555-0100", "617-555-0100", "16175550100"]) {
@@ -43,6 +57,7 @@ describe("resolvePrincipal", () => {
       expect(p.displayName).toBe("Maria");
       expect(p.phone).toBe("+16175550100");
     }
+    expect(resolvePrincipal(inbound({ channel: "whatsapp", from: "+16175550100" }), config, c).kind).toBe("owner");
     for (const channel of ["chat", "scheduled", "system"] as const) {
       expect(resolvePrincipal(inbound({ channel, from: "anything" }), config, c).kind).toBe("owner");
     }
@@ -108,5 +123,50 @@ describe("resolvePrincipal", () => {
     const p = resolvePrincipal(inbound({ channel: "imessage", from: "+16175550101" }), config, c);
     expect(p.kind).toBe("contact");
     expect(p.tier).toBe("stranger");
+  });
+});
+
+describe("resolvePrincipal caps on unauthenticated channels", () => {
+  const config = testConfig();
+
+  function withStaff(): ContactStore {
+    const store = new ContactStore(tempState());
+    store.upsert({ name: "Research", tier: "staff", phones: ["+14155550123"], emails: ["research@team.example"], agentHandle: "research-bot" });
+    return store;
+  }
+
+  it("never gives an email sender more than partner, so a forged From of a staff contact gets partner", () => {
+    const c = withStaff();
+    const p = resolvePrincipal(inbound({ channel: "email", from: "Research@Team.example" }), config, c);
+    expect(p.kind).toBe("contact");
+    expect(p.contactId).toBe("research");
+    expect(p.tier).toBe(OWNER_EMAIL_TIER);
+    expect(p.tier).toBe("partner");
+  });
+
+  it("caps an email-looking sender on another channel too, and a bare handle on the email channel", () => {
+    const c = withStaff();
+    expect(resolvePrincipal(inbound({ channel: "sms", from: "research@team.example" }), config, c).tier).toBe("partner");
+    const handle = resolvePrincipal(inbound({ channel: "email", from: "research-bot" }), config, c);
+    expect(handle.contactId).toBe("research");
+    expect(handle.tier).toBe("partner");
+  });
+
+  it("gives staff only to the contact's agent over A2A; the same contact by phone is partner", () => {
+    const c = withStaff();
+    const agent = resolvePrincipal(inbound({ channel: "a2a", from: "@research-bot" }), config, c);
+    expect(agent).toMatchObject({ kind: "agent", tier: "staff", agentHandle: "research-bot" });
+    const phone = resolvePrincipal(inbound({ channel: "sms", from: "+14155550123" }), config, c);
+    expect(phone).toMatchObject({ kind: "contact", contactId: "research", tier: "partner" });
+  });
+
+  it("never raises a tier: lower-tier email senders keep their tier", () => {
+    const c = withStaff();
+    c.upsert({ name: "Alex Kim", tier: "friend", emails: ["alex@example.com"] });
+    expect(resolvePrincipal(inbound({ channel: "email", from: "alex@example.com" }), config, c).tier).toBe("friend");
+    for (const tier of TIER_ORDER) {
+      const capped = capTier({ kind: "contact", id: "x", tier, displayName: "x" }, "partner");
+      expect(TIER_ORDER.indexOf(capped.tier), tier).toBe(Math.max(TIER_ORDER.indexOf(tier), TIER_ORDER.indexOf("partner")));
+    }
   });
 });

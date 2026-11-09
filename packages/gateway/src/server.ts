@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createHash } from "node:crypto";
 import type { InkboxProvisioner } from "@open-instinct/inkbox";
-import { DurableInbox } from "@open-instinct/inkbox";
+import { DurableInbox, RetryAfterError } from "@open-instinct/inkbox";
 import { join } from "node:path";
 import { type SignupLimits, SlidingWindowLimiter, clientAddress, pendingCount, signupLimits } from "./limits.js";
 import { type Logger, consoleLogger } from "./logger.js";
@@ -47,11 +48,34 @@ export interface GatewayOptions {
    * the connect link to the phone itself.
    */
   notifyExisting?: (user: UserRecord, connectUrl: string) => Promise<void>;
+  /**
+   * Renders the one-line pages people see at the end of a flow that lands on the gateway
+   * (the Link wallet callback, a lost connect page). A front door with its own brand passes
+   * its page renderer; the default is the gateway's own look.
+   */
+  renderPage?: (title: string, text: string, status: "ok" | "error") => string;
+  /**
+   * Called with every verified, parsed inbound event before it is queued for the
+   * agent. A front door can learn the sender's phone from the first message or
+   * keep counters. It gets a deep copy, so it cannot change what is relayed. A throw
+   * or a rejected promise is logged and never blocks or crashes the relay; the hook
+   * is not awaited.
+   */
+  onInbound?: (user: UserRecord, event: Record<string, unknown>) => void | Promise<void>;
+  /** Ask Maritime for the agent's state before every relay (true), never (false), or only for agents under 15 minutes old (default). */
+  checkAgentStatus?: boolean;
 }
 
 export interface GatewayServer extends Server {
   /** Restart provisioning for every record left in "provisioning" by an earlier process. Returns how many. */
   resumePending(): number;
+  /**
+   * Add any webhook event the gateway now needs (see DEFAULT_WEBHOOK_EVENTS) to the
+   * subscription of every ready user, so identities provisioned before an event existed
+   * (call.ended) receive it. Best effort, one user at a time; a failure is logged and
+   * skipped. Returns how many subscriptions gained an event.
+   */
+  backfillWebhookEvents(): Promise<number>;
   /** Stop admission work and wait for forwarding requests already in flight. */
   drainWebhooks(): Promise<void>;
 }
@@ -91,6 +115,9 @@ function send(res: ServerResponse, status: number, type: string, body: string | 
 const json = (res: ServerResponse, status: number, value: unknown) => send(res, status, JSON_TYPE, JSON.stringify(value));
 const html = (res: ServerResponse, status: number, page: string) => send(res, status, HTML_TYPE, page);
 
+type InboxPayload = { userId: string; identityId: string; event: Record<string, unknown> } &
+  ({ kind?: "webhook" } | { kind: "gateway"; conversationId: string });
+
 function parseBody(raw: Buffer, contentType: string | undefined): Record<string, unknown> {
   const text = raw.toString("utf8");
   if (!text.trim()) return {};
@@ -125,20 +152,28 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     fetchImpl: opts.fetchImpl,
     logger: log,
     dedupe,
+    ...(opts.checkAgentStatus !== undefined ? { checkAgentStatus: opts.checkAgentStatus } : {}),
   };
-  const inbox = new DurableInbox<{ userId: string; identityId: string; event: Record<string, unknown> }>({
+  const inbox = new DurableInbox<InboxPayload>({
     file: join(opts.store.dir, "webhook-inbox.json"),
+    now,
     replayRunning: true,
-    handle: async ({ userId, identityId, event }) => {
-      const user = opts.store.get(userId);
-      if (!user || user.identityId !== identityId) {
+    handle: async (payload) => {
+      const user = opts.store.get(payload.userId);
+      if (!user || user.identityId !== payload.identityId) {
         const error = new Error("Webhook identity is no longer assigned to this user");
         error.name = "InboundUncertainError";
         throw error;
       }
       if (!user.maritimeAgentId) throw new Error("Agent is not ready");
-      const result = await relayVerifiedEvent(user, event, relayDeps);
-      if (result.status === "rejected") throw new Error(result.reason ?? "Forwarding failed");
+      const result = payload.kind === "gateway"
+        ? await relayGatewayEvent(user, payload.event, payload.conversationId, relayDeps)
+        : await relayVerifiedEvent(user, payload.event, relayDeps);
+      if (result.status === "rejected") {
+        const reason = result.reason ?? "Forwarding failed";
+        if (result.retryAfterMs !== undefined) throw new RetryAfterError(reason, result.retryAfterMs);
+        throw new Error(reason);
+      }
     },
     onError: (id, status) => log.warn("relay.pending", { id, status }),
   });
@@ -200,6 +235,24 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       n++;
     }
     if (n > 0) log.info("provision.resumed", { count: n });
+    return n;
+  }
+
+  async function backfillWebhookEvents(): Promise<number> {
+    if (!opts.inkbox) return 0;
+    let n = 0;
+    for (const u of opts.store.all()) {
+      if (u.status !== "ready" || !u.webhookSubscriptionId) continue;
+      try {
+        const added = await opts.inkbox.ensureWebhookEvents(u.webhookSubscriptionId);
+        if (added.length > 0) {
+          n++;
+          log.info("provision.webhook_events_added", { userId: u.id, subscriptionId: u.webhookSubscriptionId, added });
+        }
+      } catch (err) {
+        log.warn("provision.webhook_events_failed", { userId: u.id, subscriptionId: u.webhookSubscriptionId, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
     return n;
   }
 
@@ -301,15 +354,32 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     } catch {
       return json(res, 400, { error: "expected a webhook event with an id" });
     }
+    if (opts.onInbound) {
+      const hookFailed = (err: unknown) => log.warn("webhook.on_inbound_failed", { userId, error: err instanceof Error ? err.message : String(err) });
+      try {
+        const pending = opts.onInbound(structuredClone(user), structuredClone(event));
+        if (pending && typeof (pending as Promise<void>).then === "function") (pending as Promise<void>).then(undefined, hookFailed);
+      } catch (err) {
+        hookFailed(err);
+      }
+    }
     inbox.enqueue(`${user.id}:${event.id}`, { userId: user.id, identityId: user.identityId, event });
     res.writeHead(204);
     res.end();
   }
 
   /** Link sends the browser here after approval. The code goes to the agent, which holds the PKCE verifier. */
+  const page = opts.renderPage ?? renderMessage;
+  const linkDone = (ok: boolean): string =>
+    opts.renderPage
+      ? ok
+        ? opts.renderPage("Connected", "Your wallet is on its way to your agent. Go back to your messages; it will confirm there.", "ok")
+        : opts.renderPage("Not connected", "The wallet connection could not be handed to your agent right now. Ask it to try again from your messages.", "error")
+      : renderLinkDone(ok);
+
   async function handleLinkCallback(res: ServerResponse, userId: string, query: URLSearchParams): Promise<void> {
     const user = opts.store.get(userId);
-    if (!user) return html(res, 404, renderMessage("Not found", "No Instinct with that id.", "error"));
+    if (!user) return html(res, 404, page("Not found", "No agent with that id.", "error"));
     const code = query.get("code") ?? "";
     const state = query.get("state") ?? "";
     const error = query.get("error") ?? undefined;
@@ -317,8 +387,16 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     const event: Record<string, unknown> = { type: "link.oauth_callback", code, state, receivedAt: new Date(now()).toISOString() };
     if (error) event["error"] = error;
     const result = await relayGatewayEvent(user, event, `link:${user.id}`, relayDeps);
+    if (result.retryAfterMs !== undefined) {
+      const digest = createHash("sha256").update(JSON.stringify([user.id, code, state, error])).digest("hex");
+      inbox.enqueue(`link:${user.id}:${digest}`, {
+        kind: "gateway", userId: user.id, identityId: user.identityId, event, conversationId: `link:${user.id}`,
+      }, result.retryAfterMs);
+      log.info("link.callback", { userId: user.id, status: "queued", reason: result.reason });
+      return html(res, 200, linkDone(true));
+    }
     log.info("link.callback", { userId: user.id, status: result.status, reason: result.reason });
-    return html(res, result.status === "forwarded" ? 200 : 502, renderLinkDone(result.status === "forwarded"));
+    return html(res, result.status === "forwarded" ? 200 : 502, linkDone(result.status === "forwarded"));
   }
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -358,6 +436,15 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       return handleLinkCallback(res, decodeURIComponent(parts[3] ?? ""), url.searchParams);
     }
+    if (parts[0] === "oauth" && parts[1] === "link" && parts[2] === "callback" && parts.length === 3) {
+      // One registered redirect URI for the whole fleet: the agent put its handle in front of the
+      // OAuth state (`<handle>.<random>`), so the callback finds the user from there.
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      const handle = (url.searchParams.get("state") ?? "").split(".")[0] ?? "";
+      const user = handle ? opts.store.byHandle(handle) : undefined;
+      if (!user) return html(res, 404, page("Not found", "This link does not belong to an agent here. Start the connection again from your agent.", "error"));
+      return handleLinkCallback(res, user.id, url.searchParams);
+    }
     throw new HttpError(404, "not found");
   }
 
@@ -365,12 +452,12 @@ export function createGateway(opts: GatewayOptions): GatewayServer {
     route(req, res).catch((err: unknown) => {
       const status = err instanceof HttpError ? err.status : 500;
       const message = err instanceof HttpError ? err.message : "internal error";
-      if (status >= 500) log.error("request.failed", { path: req.url, error: err instanceof Error ? err.message : String(err) });
+      if (status >= 500) log.error("request.failed", { path: req.url?.split("?")[0], error: err instanceof Error ? err.message : String(err) });
       if (res.headersSent) return res.end();
       json(res, status, { error: message });
     });
   });
   server.on("listening", () => inbox.start());
   server.on("close", () => inbox.stop());
-  return Object.assign(server, { resumePending, drainWebhooks: () => inbox.close() });
+  return Object.assign(server, { resumePending, backfillWebhookEvents, drainWebhooks: () => inbox.close() });
 }

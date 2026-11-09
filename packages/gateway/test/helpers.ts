@@ -56,7 +56,7 @@ export function imessageEvent(id = "evt_1", conversationId = "conv_9"): Record<s
 export interface FakeInkbox {
   calls: string[];
   provisioner: InkboxProvisioner;
-  fail: Partial<Record<"provisionIdentity" | "mintIdentityKey" | "ensureSigningKey" | "subscribeWebhooks", number>>;
+  fail: Partial<Record<"provisionIdentity" | "mintIdentityKey" | "ensureSigningKey" | "subscribeWebhooks" | "ensureWebhookEvents", number>>;
 }
 
 /** A provisioner whose methods record their order and can be told to fail n times. */
@@ -102,6 +102,12 @@ export function fakeInkbox(opts: { subscriptionSigningKey?: string } = {}): Fake
       return { id: "inv_1" };
     },
     async deleteIdentity() {},
+    // Every subscription is missing call.ended, as one made before the event existed would be.
+    async ensureWebhookEvents(subscriptionId: string) {
+      calls.push(`ensureWebhookEvents ${subscriptionId}`);
+      maybeFail("ensureWebhookEvents");
+      return ["call.ended"];
+    },
   } as unknown as InkboxProvisioner;
   return { calls, provisioner, fail };
 }
@@ -112,10 +118,12 @@ export interface FakeMaritime {
   /** Status codes to answer in order before falling back to success. */
   queue: Array<number | Error | { body: unknown }>;
   existingAgents: Array<{ id: string; externalId: string; projectId?: string }>;
+  /** Status answered for GET /api/agents/<id>; ids not listed answer 404. */
+  agentStatus: Record<string, string>;
 }
 
 export function fakeMaritime(): FakeMaritime {
-  const state: FakeMaritime = { calls: [], queue: [], existingAgents: [], fetch: undefined as unknown as typeof fetch };
+  const state: FakeMaritime = { calls: [], queue: [], existingAgents: [], agentStatus: {}, fetch: undefined as unknown as typeof fetch };
   state.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
@@ -126,6 +134,11 @@ export function fakeMaritime(): FakeMaritime {
     if (next instanceof Error) throw next;
     if (typeof next === "number") return new Response(JSON.stringify({ detail: `status ${next}` }), { status: next });
     if (next && typeof next === "object") return new Response(JSON.stringify(next.body), { status: 200 });
+    if (method === "GET" && /\/api\/agents\/[^/?]+$/.test(url)) {
+      const id = decodeURIComponent(url.split("/").pop() ?? "");
+      const status = state.agentStatus[id];
+      return status ? new Response(JSON.stringify({ id, status }), { status: 200 }) : new Response(JSON.stringify({ detail: "not found" }), { status: 404 });
+    }
     if (method === "GET" && url.includes("/api/agents?externalId=")) {
       const ext = decodeURIComponent(url.split("externalId=")[1] ?? "");
       return new Response(JSON.stringify(state.existingAgents.filter((a) => a.externalId === ext)), { status: 200 });

@@ -89,10 +89,11 @@ open-instinct/
     apps/      @open-instinct/apps      Composio Tool Router: per-user session, MCP tools, connect links
     network/   @open-instinct/network   trusted network: contacts, tiers, grants, invitations, OIP envelope, A2A tools
     payments/  @open-instinct/payments  Stripe Link agent wallet: OAuth, spend requests, one-time cards, payment_* tools
+    ample/     @open-instinct/ample     web app deploys through the Ample CLI: ample_deploy, ample_logs, ample_apps, ample_app_delete
     server/    @open-instinct/server    the agent process: /health, /chat, /schedules, webhook intake, Link callback, smoke test
     gateway/   @open-instinct/gateway   multi-user relay + signup: Inkbox webhooks → Maritime agent; connect page with QR
     cli/       @open-instinct/cli       `instinct` command: init, connect, dev, chat, status, deploy, invite, trust, schedules, payments
-  skills/      SKILL.md playbooks the agent loads (onboarding, scheduling, dining, travel, rides, email-triage, research, purchases, files, daily-brief, trusted-network, maritime-computer)
+  skills/      SKILL.md playbooks the agent loads (onboarding, scheduling, dining, travel, rides, email-triage, research, purchases, files, daily-brief, trusted-network, maritime-computer, web-apps)
   examples/    local-chat.mjs, fake-inkbox-webhook.mjs, dinner-a2a.mjs (see examples/README.md)
   deploy/      Dockerfile.agent, Dockerfile.gateway, docker-compose.yml, entrypoint.sh, .env.example
   .github/workflows/build-images.yml   builds and pushes both images to GHCR
@@ -202,12 +203,14 @@ policy engine checks. Groups:
 | schedule | `schedule_create`, `schedule_list`, `schedule_delete` | `core` | always |
 | web | `web_search`, `web_fetch` (public hosts only, no login) | `core` | always |
 | files | `read`, `write`, `edit`, `bash`, `ls`, `grep`, scoped to `workspace/` | `pi-coding-agent` factories wrapped by `server` | always, owner only |
-| files | `create_pdf` (markdown to a real PDF under `workspace/`: headings, lists, tables, code, links, page numbers) | `core` | always, owner only |
+| files | `create_pdf` (markdown to a real PDF under `workspace/`: headings, lists, tables, code, links, page numbers, `![caption](path)` images from the workspace) | `core` | always, owner only |
+| files | `image_generate` (a PNG from a prompt, saved under `workspace/`, through an OpenAI-compatible `/images/generations` endpoint) | `core` | always, owner only; needs `IMAGE_API_KEY` or `OPENAI_API_KEY` to do anything |
 | contacts and trust | `contacts_search`, `contacts_upsert`, `trust_set_tier`, `trust_grant`, `trust_revoke`, `trust_list` | `@open-instinct/network` | always |
 | network | `ask_instinct` (one contact, or several for a group plan), `reply_instinct`, `invite_to_network` | `@open-instinct/network` | always; A2A sends need Inkbox, invitations need `INKBOX_ADMIN_API_KEY` |
 | computer (in the VM) | `computer`, `computer_batch`, `request_takeover`, `takeover_status`, `computer_read_file`, `computer_write_file` | `@open-instinct/computer` over desktopd REST | `INSTINCT_COMPUTER` is `auto` or `desktopd` and desktopd answers |
 | computer (hosted) | the server's own names: `get_computer`, `computer`, `computer_batch`, `run_shell`, `read_file`, `write_file`, `request_takeover`, `takeover_status`, `close_computer` | `@open-instinct/computer` over MCP | `MARITIME_API_KEY` and no in-VM desktop |
 | apps | one `app_<slug>` tool per Composio tool (for example `app_googlecalendar_events_list`) | `@open-instinct/apps` over MCP | `COMPOSIO_API_KEY` is set |
+| files | `ample_deploy` (a workspace folder to a public URL), `ample_logs`, `ample_apps`, `ample_app_delete` | `@open-instinct/ample`, driving the `ample` CLI | `AMPLE_SIGNUP=1`, or `AMPLE_CLIENT_ID` and `AMPLE_CLIENT_SECRET` (or `AMPLE_TOKEN`) are set; owner only |
 | payments | `payment_connect`, `payment_request`, `payment_status`, `payment_list` | `@open-instinct/payments` | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET` and `STRIPE_PUBLISHABLE_KEY` are set |
 
 MCP results are converted with `pi-mcp`'s `toLlmContent()`. Composio tool names get the `app_` prefix
@@ -216,7 +219,7 @@ Maritime's documentation work unchanged.
 
 ## Trust and permissions
 
-Six tiers: `owner`, `partner`, `family`, `friend`, `contact`, `stranger`. Each tier has default
+Seven tiers: `owner`, `staff` (your own agents working as a team), `partner`, `family`, `friend`, `contact`, `stranger`. Each tier has default
 capabilities; the owner adds scoped, time-boxed grants ("Sam can book us dinner this week").
 Anything not granted is denied. Purchases and calendar writes by non-owners default to
 "ask the owner", which sends the owner a one-line approval text.
@@ -293,7 +296,9 @@ Server:
 | `INSTINCT_MODEL` | `provider/model`, default `anthropic/claude-fable-5-1`; `openai-compatible/<id>` uses `OPENAI_BASE_URL` |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, ... | model access, looked up per Pi provider |
 | `INSTINCT_OWNER_NAME`, `INSTINCT_OWNER_PHONE`, `INSTINCT_OWNER_EMAIL`, `INSTINCT_OWNER_TIMEZONE`, `INSTINCT_AGENT_NAME` | who the owner is and what the agent is called; seeded into `config.json` on first boot |
+| `INSTINCT_CLAIM_OWNER_ON_FIRST_CONTACT`, `INSTINCT_OWNER_CLAIM_CODE`, `INSTINCT_OWNER_CLAIM_EXPIRES_AT` | `1` with no owner phone: the first person who texts the agent 1:1 on iMessage or SMS a message containing the one-time claim code becomes the owner, once (`config.owner.claimOnFirstContact`, `claimCode`, `claimExpiresAt`). No code (or one under 8 letters/digits, or past the optional ISO expiry) means nobody can claim, and boot logs a warning. The front door shows the code only to the person who signed up. Case, spaces and dashes are ignored; a wrong code leaves the sender a stranger, with 10 tries per number. A claim clears the code and the flag from `config.json`, and the code is stripped from the message before the model sees it. Group threads, unresolved scopes, duplicates, email and A2A never claim |
 | `INSTINCT_PERSONA` | seeds `<data>/PERSONA.md` on first boot only; after that the file is the owner's (`instinct persona`) |
+| `INSTINCT_INSTRUCTIONS` | seeds `<data>/AGENTS.md`; a changed value replaces the file on the next boot unless the owner edited it (`AGENTS.md.seed` remembers the last seed) |
 | `INKBOX_API_KEY`, `INKBOX_AGENT_HANDLE`, `INKBOX_IDENTITY_ID` | identity-scoped Inkbox credentials; turn on the Inkbox outbox, messaging tools and A2A |
 | `INKBOX_SIGNING_KEY` | webhook signing key (also read from `secrets/webhook.json`) |
 | `INKBOX_ADMIN_API_KEY` | org-wide key: invitations, contact rules, webhook subscription with the tunnel |
@@ -301,14 +306,16 @@ Server:
 | `INSTINCT_CHAT_TOKEN` | bearer token for `/chat`, `/status`, `/schedules` |
 | `INSTINCT_BIND` | bind address; default `127.0.0.1`, or `0.0.0.0` when `PORT` or a `MARITIME_*` variable is set |
 | `INSTINCT_PUBLIC_URL` | this agent's public URL, used to build the Link callback |
-| `INSTINCT_REPLY_BUDGET_MS` | how long `/chat` waits before acknowledging (default 20000) |
-| `INSTINCT_SKILLS_DIR` | SKILL.md folder (default `<repo>/skills`) |
+| `INSTINCT_ACK_SLOW_REPLIES` | `1` texts the owner one "on it" in their 1:1 iMessage/SMS thread when a turn is still running after `INSTINCT_REPLY_BUDGET_MS` (`config.features.ackSlowReplies`); never for a queued text, a group or a non-owner |
+| `INSTINCT_REPLY_BUDGET_MS` | how long `/chat` waits before acknowledging, and the delay before the optional slow-reply text (default 20000) |
+| `INSTINCT_SKILLS_DIR` | SKILL.md folder (default `<repo>/skills`); the owner's `<data>/skills` is read after it, every 30 s. Built-ins win a name clash, and an owner skill is private to the owner unless its frontmatter says `visibility: public` |
 | `INSTINCT_COMPUTER` | `auto` (desktopd if present, else hosted if `MARITIME_API_KEY`, else none), `desktopd`, `maritime`, `none` |
 | `MARITIME_API_KEY`, `MARITIME_COMPUTERS_MCP_URL` | hosted computer fallback |
 | `MARITIME_DESKTOP`, `MARITIME_AGENT_ID`, `MARITIME_BACKEND_URL`, `MARITIME_INTERNAL_TOKEN`, `PORT` | injected by Maritime inside a hosted agent |
 | `COMPOSIO_API_KEY`, `COMPOSIO_TOOLKITS` | apps; the key alone turns them on |
 | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY`, `LINK_REDIRECT_URI` | payments; all three keys together turn them on |
 | `BRAVE_SEARCH_API_KEY` | better `web_search` |
+| `IMAGE_API_KEY`, `IMAGE_BASE_URL`, `IMAGE_MODEL` | `image_generate`; defaults to `OPENAI_API_KEY` / `OPENAI_BASE_URL` and `gpt-image-1` |
 
 Gateway: `GATEWAY_PUBLIC_URL`, `GATEWAY_DATA_DIR`, `GATEWAY_SIGNUP_SECRET`, `GATEWAY_ALLOW_OPEN_SIGNUP`,
 `GATEWAY_TRUST_PROXY`, `INSTINCT_AGENT_IMAGE`, `INSTINCT_IDLE_TTL_SECONDS`, `INSTINCT_USE_MARITIME_LLM`,

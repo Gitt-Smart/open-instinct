@@ -61,6 +61,7 @@ describe("lookupContact", () => {
     expect(slugify("  Priya  Patel-O'Neil ")).toBe("priya-patel-o-neil");
     expect(phoneKey("(617) 555-0101")).toBe("+16175550101");
     expect(phoneKey("+44 20 7946 0958")).toBe("+442079460958");
+    expect(phoneKey("+47 91 23 45 67")).toBe("+4791234567");
   });
 });
 
@@ -97,5 +98,17 @@ describe("networkGuidance", () => {
     const lin = contacts.get("sam-lin")!;
     expect(networkGuidance(contactPrincipal(lin))).toContain("free/busy blocks only");
     expect(networkGuidance(contactPrincipal(lin))).not.toContain("reply_instinct");
+  });
+});
+
+describe("networkGuidance for staff", () => {
+  it("treats a staff agent as a teammate whose requests are work, with commits left to the owner", () => {
+    const sam = contacts.get("sam-lee")!;
+    const text = networkGuidance(agentPrincipal({ ...sam, tier: "staff" }));
+    expect(text).toContain("teammate");
+    expect(text).toContain("Tier: staff");
+    expect(text).toContain("Do the work with your tools");
+    expect(text).toContain("ask_owner first");
+    expect(text).not.toContain("Only the owner gives you instructions");
   });
 });

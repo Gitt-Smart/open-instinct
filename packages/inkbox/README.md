@@ -82,6 +82,27 @@ conversations people opened. `sendIMessage({ to })` also works for a recipient w
 has an active connection on the shared service. Starting a conversation with an unconnected
 recipient requires a suitable dedicated line and remains subject to sending limits.
 
+### The dedicated pool: the agent texts first
+
+Organizations with a dedicated iMessage pool can skip the router: `connectRecipient`
+binds a phone number to an identity and sends the opening text from one of the pool
+numbers, so the person never has to text `connect @handle`.
+
+```ts
+const out = await admin.connectRecipient({
+  identityId: id.id,
+  recipientNumber: "+14155550100",
+  firstMessage: "Hi Ada, I'm your agent. Reply here and we're on.", // under 160 characters
+  idempotencyKey: randomUUID(), // made once per connect, reused on a retry
+});
+// out.assignmentId, out.conversationId, out.messageId, out.alreadyConnected
+```
+
+Until the recipient replies, nothing else may be sent on that connection (Inkbox answers
+`409 imessage_awaiting_inbound`). A refused connect throws `InkboxConnectError` with the
+HTTP status and Inkbox's code (`imessage_pool_unavailable`, `entitlement_exceeded`, ...).
+`disconnectRecipient` undoes it; an already-disconnected pair counts as done.
+
 ## Webhooks
 
 Subscribe once per identity. The default event list is:
@@ -159,6 +180,8 @@ the receiving agent deduplicates it. On the agent, failures before model admissi
 retryable; an interrupted admitted turn with an uncertain outcome is recorded as
 `uncertain`, not blindly replayed. Back up the receipt file with the rest of the agent
 state. It is a single-process store, not a shared queue for multiple replicas.
+If a handler throws `new RetryAfterError(message, delayMs)`, the inbox persists a next
+attempt time at least `delayMs` away while still applying its normal backoff.
 
 ## Sending
 

@@ -4,6 +4,7 @@
  * configured. Everything it builds is returned so main.ts, the smoke test and
  * embedders can drive it the same way.
  */
+import { resolve } from "node:path";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { Model } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
@@ -21,23 +22,35 @@ import {
   coreTools,
   ensurePersona,
   loadConfig,
+  ownerClaimStatus,
+  syncInstructions,
   loadPolicy,
   resolveDataDir,
   resolveModel,
 } from "@open-instinct/core";
-import type { InboundMessage, InstinctConfig, Outbox, RegisteredTool } from "@open-instinct/core";
-import { InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, messagingTools, sendFileTool } from "@open-instinct/inkbox";
+import type { InboundMessage, InstinctConfig, Outbox, Principal, RegisteredTool } from "@open-instinct/core";
+import { CALL_ORIGINATIONS, DurableInbox, InkboxA2A, InkboxChannel, InkboxInboundHydrator, InkboxProvisioner, handleCallEnded, messagingTools, sendFileTool, voiceInstructions } from "@open-instinct/inkbox";
+import type { CallEndedEvent, CallOrigination } from "@open-instinct/inkbox";
+import { WhatsAppChannel } from "@open-instinct/whatsapp";
 import { computerGuidance, detectComputer } from "@open-instinct/computer";
 import type { ComputerBackend } from "@open-instinct/computer";
-import { ComposioApps, DEFAULT_TOOLKITS, appsGuidance, appsTools } from "@open-instinct/apps";
+import { ComposioApps, DEFAULT_TOOLKITS, OPENAI_COMPLETIONS_TOOL_LIMIT, appsGuidance, appsTools, composioModeFor } from "@open-instinct/apps";
+import { ampleTools, type AmpleCredentials } from "@open-instinct/ample";
+import { AtomicMailBackend, atomicMailGuidance } from "@open-instinct/atomicmail";
+import { contextTools } from "@open-instinct/context";
+import { keenableTools } from "@open-instinct/keenable";
 import { networkTools } from "@open-instinct/network";
 import { ChatAwareOutbox, ConsoleOutbox, type ChatReplyBuffer } from "./console-outbox.js";
-import { fileTools } from "./file-tools.js";
+import { fileTools, resolveInsideWorkspace } from "./file-tools.js";
 import { describeDataPart, promptExtraFor } from "./hooks.js";
 import { appsNotConfiguredTool, setupSummaryFor } from "./setup-summary.js";
 import { createScheduleSync, type ScheduleSync } from "./maritime-schedules.js";
 import { loadPaymentsModule, paymentsEnv, type LinkWalletLike, type PaymentsModule } from "./payments.js";
-import { formatSkillsIndex, loadSkillList, loadSkillTool, resolveSkillsDir } from "./skills.js";
+import { createSkillCatalog, formatSkillsIndex, loadSkillTool, ownerSkillsDir, resolveSkillsDir, skillsFor } from "./skills.js";
+
+/** How often the skill folders are re-read; an owner-installed skill shows up within this. */
+const SKILLS_REFRESH_MS = 30_000;
+import { ChannelRouter, whatsappEnabled } from "./whatsapp.js";
 
 export interface BootOptions {
   streamFn?: StreamFn;
@@ -70,6 +83,8 @@ export interface BootResult {
   wallet?: LinkWalletLike;
   /** Complete compact Inkbox events before handing them to the runtime. */
   hydrateInbound?: (message: InboundMessage) => Promise<InboundMessage>;
+  /** Set with Inkbox: text the owner the outcome of a finished phone call. */
+  onCallEnded?: (event: CallEndedEvent) => Promise<void>;
 }
 
 export const DEFAULT_MARITIME_MCP_URL = "https://mcp.maritime.sh";
@@ -81,8 +96,18 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   const state = new StateDir(resolveDataDir(env));
   state.ensure();
   const config = loadConfig(state, env);
+  if (config.owner.claimOnFirstContact && config.owner.phones.length === 0) {
+    const claim = ownerClaimStatus(config);
+    log(claim.enabled
+      ? `owner claim open: the first 1:1 iMessage/SMS carrying the one-time code becomes the owner${config.owner.claimExpiresAt ? ` (until ${config.owner.claimExpiresAt})` : ""}`
+      : `WARNING: owner claim is disabled: ${claim.reason}. Nobody can claim this agent until a valid code is set`);
+  }
   // PERSONA.md is the owner's file; INSTINCT_PERSONA seeds it on first boot only.
   if (ensurePersona(state, env.INSTINCT_PERSONA)) log(`wrote ${state.path("PERSONA.md")}${env.INSTINCT_PERSONA?.trim() ? " from INSTINCT_PERSONA" : " (default persona)"}`);
+  // AGENTS.md is the owner's standing-instructions file. INSTINCT_INSTRUCTIONS seeds it, and a changed seed
+  // replaces it as long as the owner never edited the file; an edited file is theirs.
+  const instructions = syncInstructions(state, env.INSTINCT_INSTRUCTIONS);
+  if (instructions === "created" || instructions === "updated") log(`${instructions} ${state.path("AGENTS.md")} from INSTINCT_INSTRUCTIONS`);
 
   const audit = new AuditLog(state);
   const policy = new PolicyEngine(loadPolicy(state), {
@@ -90,7 +115,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   });
   const approvals = new ApprovalStore(state);
   const scheduler = new Scheduler(state);
-  const contacts = new ContactStore(state);
+  const contacts = new ContactStore(state, { warn: log });
   const memory = new MemoryStore(state);
   const a2aStore = new A2AStore(state);
 
@@ -135,6 +160,20 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     log("Inkbox not configured: replies go to the console outbox");
   }
 
+  // WhatsApp: the agent's own account as a linked device. Replies on the whatsapp channel go
+  // through it; everything else keeps the transport above. It starts once the runtime exists.
+  let whatsappInbox: DurableInbox<InboundMessage> | undefined;
+  const whatsapp = whatsappEnabled(env)
+    ? new WhatsAppChannel({
+        authDir: state.path("secrets", "whatsapp"),
+        mediaDir: state.path("workspace", "inbound"),
+        ...(env.WHATSAPP_PHONE?.trim() ? { phone: env.WHATSAPP_PHONE.trim() } : {}),
+        onInbound: (message) => void whatsappInbox?.enqueue(message.id, message),
+        logger: log,
+      })
+    : undefined;
+  if (whatsapp) outbox = new ChannelRouter(outbox, { whatsapp });
+
   const registry = new ToolRegistry();
   const promptSections: string[] = [];
 
@@ -147,15 +186,61 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       config,
       outbox,
       workspaceDir: state.path("workspace"),
+      onApprovalSettled: (approval, approved) => runtime.afterApproval(approval, approved),
+      // Image generation rides on an OpenAI-compatible key: a dedicated IMAGE_API_KEY, else the model key
+      // (an OpenAI-compatible proxy that forwards /images/generations works too). The shell never sees either.
+      ...(env.IMAGE_API_KEY || env.OPENAI_API_KEY
+        ? {
+            images: {
+              apiKey: (env.IMAGE_API_KEY || env.OPENAI_API_KEY) as string,
+              ...(env.IMAGE_BASE_URL || env.OPENAI_BASE_URL ? { baseUrl: env.IMAGE_BASE_URL || env.OPENAI_BASE_URL } : {}),
+              ...(env.IMAGE_MODEL ? { model: env.IMAGE_MODEL } : {}),
+            },
+          }
+        : {}),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       ...(env.BRAVE_SEARCH_API_KEY ? { searchApiKey: env.BRAVE_SEARCH_API_KEY } : {}),
+      // Opt-in: YDC_API_KEY, or YOU_SEARCH=1 for the keyless tier. Unset keeps Brave or DuckDuckGo.
+      ...(env.YDC_API_KEY || env.YOU_SEARCH === "1" ? { youSearch: env.YDC_API_KEY ? { apiKey: env.YDC_API_KEY } : {} } : {}),
     }),
   );
 
+  if (env.CONTEXT_DEV_API_KEY) {
+    registry.registerMany(
+      contextTools({
+        apiKey: env.CONTEXT_DEV_API_KEY,
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+  }
+
+  // Keenable works without a key, so it needs its own switch; a key also turns it on.
+  // The switch takes what the gateway takes (1, true, yes): `instinct deploy` forwards it as written.
+  if (/^(1|true|yes)$/i.test(env.KEENABLE_SEARCH?.trim() ?? "") || env.KEENABLE_API_KEY) {
+    registry.registerMany(
+      keenableTools({
+        ...(env.KEENABLE_API_KEY ? { apiKey: env.KEENABLE_API_KEY } : {}),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+  }
+
   // Messaging needs Inkbox. send_file does not: without a wire it still hands files
   // to the dashboard chat, which is how `instinct chat` and the smoke test get them.
-  if (channel) registry.registerMany(messagingTools({ channel, contacts, config, dataDir: state.root }));
+  const callOrigination = callOriginationFrom(env);
+  if (channel) registry.registerMany(messagingTools({ channel, contacts, config, dataDir: state.root, ...(callOrigination ? { callOrigination } : {}) }));
   else registry.register(sendFileTool({ contacts, config, dataDir: state.root }));
+  // Voice AI speaks as the owner's assistant. Only a chosen voice (INKBOX_VOICE or config.json agent.voice)
+  // triggers the write: the config is a full replace on Inkbox, and an unset voice keeps the org default.
+  const voice = env.INKBOX_VOICE?.trim() || config.agent.voice?.trim();
+  if (channel && voice) {
+    const ch = channel;
+    const set = await safely(log, "phone voice", async () => {
+      await ch.setVoiceConfig({ voice, instructions: voiceInstructions(config.owner.name) });
+      return true;
+    });
+    if (set) log(`phone voice: ${voice}`);
+  }
   const hydrator = channel ? new InkboxInboundHydrator({
     channel,
     mediaDir: state.path("workspace", "inbound"),
@@ -163,6 +248,36 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   }) : undefined;
 
   registry.registerMany(fileTools(state.path("workspace"), { env }));
+
+  // Web app deploys through Ample: with the deployer's credential, or with an
+  // account this agent signs up for itself on the first deploy (AMPLE_SIGNUP=1),
+  // which is how every person behind a shared gateway gets an account of their own.
+  const ample = ampleCredentials(env);
+  const ampleSignup = !ample && env.AMPLE_SIGNUP === "1";
+  if (ample || ampleSignup) {
+    const workspace = state.path("workspace");
+    const ownerEmail = config.owner.emails[0];
+    registry.registerMany(
+      ampleTools({
+        ...(ample
+          ? { credentials: ample }
+          : {
+              signup: {
+                file: state.path("secrets", "ample.json"),
+                name: `open-instinct-${config.agent.handle ?? "agent"}`,
+                ...(ownerEmail ? { ownerEmail } : {}),
+              },
+            }),
+        workspaceDir: workspace,
+        resolvePath: (requested) => resolveInsideWorkspace(workspace, requested),
+        env,
+        ...(env.AMPLE_API_URL ? { apiUrl: env.AMPLE_API_URL } : {}),
+        ...(env.AMPLE_BIN ? { bin: env.AMPLE_BIN } : {}),
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      }),
+    );
+    log(`ample: web app deploys on (${ample ? "shared credential" : "own account on first deploy"})`);
+  }
 
   // Computer: in-VM desktopd, hosted Maritime Computers MCP, or nothing.
   const computer = await safely(log, "computer", () =>
@@ -195,7 +310,11 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   let appsConnected: string[] | undefined;
   if (env.COMPOSIO_API_KEY) {
     const toolkits = config.apps.toolkits.length > 0 ? config.apps.toolkits : DEFAULT_TOOLKITS;
-    const composio = new ComposioApps({ apiKey: env.COMPOSIO_API_KEY, userId: externalUserId, toolkits, state, logger: log });
+    // Direct mode lists one tool per app action; router mode lists Composio's meta tools only.
+    // OpenAI-style chat completions (the Maritime LLM proxy) cap a request at 128 tools.
+    const { mode, reason } = composioModeFor(env, model.api);
+    const composio = new ComposioApps({ apiKey: env.COMPOSIO_API_KEY, userId: externalUserId, toolkits, mode, state, logger: log });
+    log(`apps: composio ${composio.mode} mode (${composio.allToolkits ? "all toolkits always use router" : reason})`);
     const connected = await safely(log, "apps", async () => {
       await composio.connect();
       const tools = await composio.tools();
@@ -209,8 +328,26 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
       const on = connected.status.filter((s: ToolkitStatus) => s.connected).map((s: ToolkitStatus) => s.slug);
       const missing = connected.status.filter((s: ToolkitStatus) => !s.connected).map((s: ToolkitStatus) => s.slug);
       appsConnected = on;
-      promptSections.push(appsGuidance(on, missing, { anyApp: composio.allToolkits }));
+      promptSections.push(appsGuidance(on, missing, { anyApp: composio.allToolkits, unavailable: composio.unavailableToolkits }));
       log(`apps: ${connected.tools.length} tools${composio.allToolkits ? " (any app by name)" : ""}, connected: ${on.join(", ") || "none"}`);
+    }
+  }
+  // Atomic Mail: an inbox of the agent's own, when the deployer gave us a key. The key is
+  // the switch. With it unset nothing here runs and nothing else changes.
+  let mailbox: AtomicMailBackend | undefined;
+  if (env.ATOMIC_MAIL_API_KEY) {
+    const backend = new AtomicMailBackend({
+      apiKey: env.ATOMIC_MAIL_API_KEY,
+      ...(env.ATOMIC_MAIL_MCP_URL ? { url: env.ATOMIC_MAIL_MCP_URL } : {}),
+      ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      logger: log,
+    });
+    const connected = await safely(log, "atomicmail", async () => ({ tools: await backend.tools(), address: await backend.address() }));
+    if (connected && connected.tools.length > 0) {
+      mailbox = backend;
+      registry.registerMany(connected.tools);
+      promptSections.push(atomicMailGuidance(connected.address));
+      log(`atomicmail: ${connected.tools.length} tools${connected.address ? ` (${connected.address})` : ""}`);
     }
   }
   // No Composio key: the model still gets an apps_connect tool, so "connect my Gmail"
@@ -254,6 +391,7 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
           clientSecret: payments.clientSecret,
           publishableKey: payments.publishableKey,
           redirectUri: payments.redirectUri,
+          ...(config.agent.handle ? { statePrefix: config.agent.handle } : {}),
           ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
         });
         return { wallet: w, tools: mod.paymentsTools({ wallet: w, outbox, config, audit, state }) };
@@ -267,14 +405,30 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
   }
 
   const skillsDir = resolveSkillsDir({ explicit: opts.skillsDir, env, packageUrl: import.meta.url });
-  const skillList = loadSkillList(skillsDir, log);
-  const skills = formatSkillsIndex(skillList);
-  if (skills) promptSections.push(skills);
-  // Registered even when every skill is hidden: those load by name from a schedule or command.
-  if (skillList.length > 0) registry.register(loadSkillTool(skillList));
-  const skillsPrompt = promptSections.length > 0 ? promptSections.join("\n\n") : undefined;
+  // The image's skills/ first, then the owner's <data>/skills. Skills are re-read every 30 s, so one
+  // installed there after boot (a git clone, a SKILL.md the agent wrote) is in the index and loadable
+  // by name on the next message. Built-ins win a name clash, and an owner skill is private (only the
+  // owner sees or loads it) unless its frontmatter says `visibility: public`.
+  const ownerDir = ownerSkillsDir(state.root);
+  const skillCatalog = createSkillCatalog({
+    builtinDirs: skillsDir && resolve(skillsDir) !== resolve(ownerDir) ? skillsDir : undefined,
+    ownerDir,
+    log,
+    refreshMs: SKILLS_REFRESH_MS,
+  });
+  skillCatalog.list();
+  // Registered even with no skill yet, and even when every skill is hidden: those load by name.
+  registry.register(loadSkillTool(skillCatalog.list));
+  const staticSections = promptSections.join("\n\n");
+  // Built per conversation, so each principal's index lists only the skills they may load.
+  const skillsPrompt = (principal: Principal) => {
+    const parts = [staticSections, formatSkillsIndex(skillsFor(skillCatalog.list(), principal))].filter((p): p is string => Boolean(p && p.trim()));
+    return parts.length > 0 ? parts.join("\n\n") : undefined;
+  };
 
-  const runtime = new AgentRuntime({
+  // eslint-disable-next-line prefer-const
+  let runtime: AgentRuntime;
+  runtime = new AgentRuntime({
     state,
     config,
     policy,
@@ -306,6 +460,21 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
 
   const stopScheduler = scheduler.start((entry) => runtime.runScheduled(entry));
 
+  if (whatsapp) {
+    // Persisted before handling, like Inkbox webhooks, so a restart mid-reply does not lose a message.
+    whatsappInbox = new DurableInbox<InboundMessage>({
+      file: state.path("whatsapp-inbox.json"),
+      handle: async (message) => {
+        await runtime.handleInbound(message, { waitForCompletion: true });
+      },
+      onError: (id, status) => log(`WhatsApp message ${id}: ${status}`),
+    });
+    // Without start() the inbox persists every message and never hands one to the runtime.
+    // Starting it also picks up messages saved before a restart.
+    whatsappInbox.start();
+    await safely(log, "whatsapp", () => whatsapp.start());
+  }
+
   let sync: ScheduleSync | undefined;
   if (env.MARITIME_BACKEND_URL && env.MARITIME_INTERNAL_TOKEN && env.MARITIME_AGENT_ID) {
     sync = createScheduleSync({
@@ -320,7 +489,14 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     sync.start();
   }
 
-  log(`agent "${config.agent.name}" ready: model ${modelSpec}, ${registry.all().length} tools, data ${state.root}`);
+  const toolCount = registry.all().length;
+  if (model.api === "openai-completions" && toolCount > OPENAI_COMPLETIONS_TOOL_LIMIT) {
+    log(
+      `warning: ${toolCount} tools registered, but ${modelSpec} accepts at most ${OPENAI_COMPLETIONS_TOOL_LIMIT} per request, ` +
+        "so owner replies will fail. Set COMPOSIO_MODE=router or shorten COMPOSIO_TOOLKITS.",
+    );
+  }
+  log(`agent "${config.agent.name}" ready: model ${modelSpec}, ${toolCount} tools, data ${state.root}`);
 
   return {
     runtime,
@@ -336,11 +512,17 @@ export async function boot(env: NodeJS.ProcessEnv, opts: BootOptions = {}): Prom
     chatBuffer,
     ...(wallet ? { wallet } : {}),
     ...(hydrator ? { hydrateInbound: (message: InboundMessage) => hydrator.hydrate(message) } : {}),
+    ...(channel ? { onCallEnded: callReporter(channel, (text, key) => runtime.relayToOwner(text, key), log) } : {}),
     async close() {
       stopScheduler();
+      await safely(log, "whatsapp close", async () => {
+        await whatsapp?.stop();
+        await whatsappInbox?.close();
+      });
       sync?.stop();
       await safely(log, "computer close", () => computer?.close());
       await safely(log, "apps close", () => apps?.close());
+      await safely(log, "atomicmail close", () => mailbox?.close());
     },
   };
 }
@@ -384,6 +566,29 @@ export function apiKeyFor(provider: string, env: NodeJS.ProcessEnv): string | un
   return undefined;
 }
 
+/** INKBOX_CALL_ORIGINATION, when it names a line Inkbox knows. Anything else is logged by the tool at boot. */
+export function callOriginationFrom(env: NodeJS.ProcessEnv): CallOrigination | undefined {
+  const raw = env.INKBOX_CALL_ORIGINATION?.trim().toLowerCase();
+  if (!raw) return undefined;
+  if ((CALL_ORIGINATIONS as readonly string[]).includes(raw)) return raw as CallOrigination;
+  throw new Error(`INKBOX_CALL_ORIGINATION must be one of ${CALL_ORIGINATIONS.join(", ")}, not "${raw}"`);
+}
+
+/** The call.ended handler: fetch the transcript when the event has none, then one text to the owner. */
+export function callReporter(
+  channel: Pick<InkboxChannel, "callTranscript">,
+  relay: (text: string, originKey: string) => Promise<boolean>,
+  log: (m: string) => void,
+): (event: CallEndedEvent) => Promise<void> {
+  return async (event) => {
+    await handleCallEnded(event, {
+      fetchTranscript: (callId) => channel.callTranscript(callId),
+      relayToOwner: (text) => relay(text, `system:call:${event.callId}`),
+      logger: log,
+    });
+  };
+}
+
 interface InkboxSettings {
   apiKey: string;
   handle: string;
@@ -395,6 +600,15 @@ function inkboxSettings(env: NodeJS.ProcessEnv, config: InstinctConfig): InkboxS
   const handle = env.INKBOX_AGENT_HANDLE ?? config.agent.handle;
   if (!apiKey || !handle) return undefined;
   return { apiKey, handle, identityId: env.INKBOX_IDENTITY_ID };
+}
+
+/** An Ample agent credential (preferred: it never expires) or a plain token. */
+export function ampleCredentials(env: NodeJS.ProcessEnv): AmpleCredentials | undefined {
+  const clientId = env.AMPLE_CLIENT_ID?.trim();
+  const clientSecret = env.AMPLE_CLIENT_SECRET?.trim();
+  if (clientId && clientSecret) return { clientId, clientSecret };
+  const token = env.AMPLE_TOKEN?.trim();
+  return token ? { token } : undefined;
 }
 
 /** Optional pieces must never stop the agent from booting. Log and go on. */

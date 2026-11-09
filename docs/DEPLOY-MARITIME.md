@@ -36,7 +36,7 @@ An analogy: the VM is a desk that folds into the wall when nobody is sitting at 
 | Inkbox org admin key | Provisions the agent's iMessage identity, mints its scoped key, subscribes webhooks | Inkbox dashboard. Set it as `INKBOX_ADMIN_API_KEY`. The gateway needs it for signup. A single user needs it once, for `instinct init`. |
 | Anthropic key | The model | Set it as `ANTHROPIC_API_KEY`. It is copied into each agent as a secret. Without a key of your own, use Maritime's metered proxy (`--maritime-llm`, or `INSTINCT_USE_MARITIME_LLM=1` on the gateway). |
 | Composio key (optional) | Gmail, Calendar, Contacts | Set `COMPOSIO_API_KEY`. `COMPOSIO_TOOLKITS` picks the toolkits; default `gmail,googlecalendar,googlecontacts`. |
-| Stripe Link (optional) | A wallet the agent can pay from, one-time cards per approved amount | Set `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET` and `STRIPE_PUBLISHABLE_KEY`. All three are required for payment tools to appear. |
+| Stripe Link (optional) | A wallet the agent can pay from, one-time cards per approved amount | Set `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET` and `STRIPE_PUBLISHABLE_KEY`. All three are required for payment tools to appear. The client id and secret come from Stripe's application form, reviewed every 3 to 5 days: apply early ([PAYMENTS.md](PAYMENTS.md#registering-an-oauth-client)). |
 | A container registry | Maritime pulls the agent image from it | GitHub Container Registry (`ghcr.io`) through the included workflow. |
 
 A note on the Maritime key. If an agent will also use the hosted Computers MCP instead of the in-VM desktop, the same key must also carry `computers`. A key with only `computers` is refused by the agents API, so a deployment that needs both uses `manage` or `*`.
@@ -151,6 +151,7 @@ Any other host works the same way: run the gateway image, give it a persistent d
 | `INSTINCT_USE_MARITIME_LLM` | no | `1` uses Maritime's metered proxy instead of your key. |
 | `INSTINCT_MARITIME_MODEL` | no | Model id behind the proxy. Default `gpt-5.4`. |
 | `COMPOSIO_API_KEY`, `COMPOSIO_TOOLKITS` | no | Apps for each new agent. |
+| `AMPLE_SIGNUP` | no | `1`: each new agent can put the sites it builds online, in an Ample account of its own ([AMPLE.md](AMPLE.md)). |
 | `LINK_CLIENT_ID`, `LINK_CLIENT_SECRET`, `STRIPE_PUBLISHABLE_KEY` | no | Stripe Link wallet for each new agent. The gateway also sets each agent's `LINK_REDIRECT_URI` to its own callback. |
 | `PORT` | no | Default `8787`. Railway injects its own. |
 | `MARITIME_API_URL`, `INKBOX_BASE_URL` | no | Override the API hosts for staging. |

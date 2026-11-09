@@ -185,6 +185,26 @@ describe("trust", () => {
     expect((await run(["trust", "revoke", grant.id], env)).code).toBe(1);
   });
 
+  it("set refuses staff for a contact without an agent handle, new or existing, and allows it with one", async () => {
+    const dir = tmpDir();
+    const env = { INSTINCT_DATA_DIR: dir };
+    const fresh = await run(["trust", "set", "Research", "staff"], env);
+    expect(fresh.code).toBe(2);
+    expect(fresh.err).toContain('Tier "staff" is only for agents');
+    expect(new ContactStore(new StateDir(dir)).all()).toHaveLength(0);
+
+    await run(["trust", "set", "Sam Lee", "friend"], env);
+    const existing = await run(["trust", "set", "sam-lee", "staff"], env);
+    expect(existing.code).toBe(2);
+    expect(existing.err).toContain("Sam Lee has no agent handle");
+    expect(new ContactStore(new StateDir(dir)).get("sam-lee")?.tier).toBe("friend");
+
+    new ContactStore(new StateDir(dir)).upsert({ name: "Research", agentHandle: "research-bot" });
+    const ok = await run(["trust", "set", "research", "staff"], env);
+    expect(ok.code, ok.err).toBe(0);
+    expect(new ContactStore(new StateDir(dir)).get("research")?.tier).toBe("staff");
+  });
+
   it("grant refuses unknown capabilities and unknown contacts", async () => {
     const env = { INSTINCT_DATA_DIR: tmpDir() };
     await run(["trust", "set", "Sam", "friend"], env);
@@ -198,6 +218,19 @@ describe("trust", () => {
 });
 
 describe("schedules", () => {
+  it("adds a schedule with a named weekday range", async () => {
+    const dir = tmpDir();
+    const result = await run(
+      ["schedules", "add", "0 9 * * mon-fri", "Morning brief", "--tz", "UTC"],
+      { INSTINCT_DATA_DIR: dir },
+    );
+
+    expect(result.code, result.err).toBe(0);
+    const entries = new Scheduler(new StateDir(dir)).list();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.cron).toBe("0 9 * * mon-fri");
+  });
+
   it("adds a cron job, lists it and removes it", async () => {
     const dir = tmpDir();
     const env = { INSTINCT_DATA_DIR: dir };
@@ -226,6 +259,15 @@ describe("schedules", () => {
     const [entry] = new Scheduler(new StateDir(dir)).list();
     expect(entry?.cron).toBeUndefined();
     expect(entry?.nextRunAt).toBe("2030-01-01T09:00:00.000Z");
+  });
+
+  it.each(["0 9 * * monkey", "0 9 * janitor *"])("rejects malformed names without saving %s", async (cron) => {
+    const dir = tmpDir();
+    const result = await run(["schedules", "add", cron, "Morning brief", "--tz", "UTC"], { INSTINCT_DATA_DIR: dir });
+    expect(result.code).toBe(2);
+    expect(result.err).toContain("bad value");
+    expect(result.err).toContain("instinct schedules --help");
+    expect(new Scheduler(new StateDir(dir)).list()).toHaveLength(0);
   });
 
   it("rejects malformed cron", async () => {
@@ -307,7 +349,16 @@ describe("deploy", () => {
 
   it("--dry-run prints the create body with secrets redacted", async () => {
     const dir = await seeded();
-    const r = await run(["deploy", "--image", "ghcr.io/maria/open-instinct-agent:v1", "--dry-run"], { INSTINCT_DATA_DIR: dir, ANTHROPIC_API_KEY: "sk-ant-x" });
+    const r = await run(["deploy", "--image", "ghcr.io/maria/open-instinct-agent:v1", "--dry-run"], {
+      INSTINCT_DATA_DIR: dir,
+      ANTHROPIC_API_KEY: "sk-ant-x",
+      CONTEXT_DEV_API_KEY: "ctxt_secret_test",
+      KEENABLE_SEARCH: "1",
+      KEENABLE_API_KEY: "keenable_test",
+      AMPLE_CLIENT_ID: "agent_test",
+      AMPLE_CLIENT_SECRET: "ample_agent_secret_test",
+      COMPOSIO_MODE: "router",
+    });
     expect(r.code, r.err).toBe(0);
     const body = JSON.parse(r.out);
     expect(body.name).toBe("instinct-maria-instinct");
@@ -323,11 +374,19 @@ describe("deploy", () => {
     expect(vars.PORT).toEqual({ key: "PORT", value: String(body.exposedPort), isSecret: false });
     expect(vars.INKBOX_API_KEY).toEqual({ key: "INKBOX_API_KEY", value: "<redacted>", isSecret: true });
     expect(vars.ANTHROPIC_API_KEY.value).toBe("<redacted>");
+    expect(vars.CONTEXT_DEV_API_KEY.value).toBe("<redacted>");
+    expect(vars.KEENABLE_SEARCH).toEqual({ key: "KEENABLE_SEARCH", value: "1", isSecret: false });
+    expect(vars.KEENABLE_API_KEY.value).toBe("<redacted>");
+    expect(vars.AMPLE_CLIENT_ID).toEqual({ key: "AMPLE_CLIENT_ID", value: "agent_test", isSecret: false });
+    expect(vars.AMPLE_CLIENT_SECRET.value).toBe("<redacted>");
+    expect(vars.AMPLE_TOKEN).toBeUndefined();
+    expect(vars.COMPOSIO_MODE).toEqual({ key: "COMPOSIO_MODE", value: "router", isSecret: false });
     expect(vars.INSTINCT_OWNER_PHONE).toEqual({ key: "INSTINCT_OWNER_PHONE", value: "+14155550100", isSecret: false });
     expect(vars.INSTINCT_DATA_DIR.value).toBe("/data");
     expect(vars.INSTINCT_MODEL.value).toBe("anthropic/claude-fable-5-1");
     expect(vars.LINK_CLIENT_ID).toBeUndefined();
     expect(r.out).not.toContain("ik_secret");
+    expect(r.out).not.toContain("ample_agent_secret_test");
   });
 
   it("keeps the Inkbox endpoint with the deployed identity credentials", async () => {

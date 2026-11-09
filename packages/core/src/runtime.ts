@@ -20,7 +20,9 @@ import type { ContactStore } from "./contacts.js";
 import type { MemoryStore } from "./memory.js";
 import { OwnerNotifier } from "./notifier.js";
 import { DEFAULT_TIER_TABLE, SPEND_CAPABILITIES, type PolicyEngine } from "./policy.js";
-import { normalizePhone, resolvePrincipal } from "./principal.js";
+import { looksLikePhone, normalizePhone, resolvePrincipal } from "./principal.js";
+import { saveConfig } from "./config.js";
+import { CLAIM_WELCOME_TEXT, MAX_CLAIM_ATTEMPTS, matchClaimCode, ownerClaimStatus } from "./owner-claim.js";
 import { readAgentsInstructions, readPersona } from "./persona.js";
 import { buildSystemPrompt, wrapUntrusted } from "./prompt.js";
 import { A2AStore, a2aState, a2aTerminal } from "./a2a-state.js";
@@ -58,7 +60,12 @@ export interface RuntimeDeps {
   registry: ToolRegistry;
   model: Model<any>;
   outbox: Outbox;
-  skillsPrompt?: string;
+  /**
+   * The skills section, or a function that rebuilds it on each prompt for the conversation's
+   * principal, so skills installed at runtime appear on the next turn and private skills are
+   * listed only to whoever may load them.
+   */
+  skillsPrompt?: string | ((principal: Principal) => string | undefined);
   streamFn?: StreamFn;
   now?: () => Date;
   replyBudgetMs?: number;
@@ -87,6 +94,8 @@ export interface HandleResult {
 export const SESSION_KEEP_MESSAGES = 60;
 /** Characters of kept transcript (JSON) before older turns are folded even if the count is under the limit. */
 export const SESSION_KEEP_CHARS = 240_000;
+/** How many of the newest image-bearing tool results keep their pictures through a fold. */
+export const KEEP_RECENT_IMAGES = 2;
 /** An approved request can be acted on for this long before it lapses. */
 export const APPROVAL_USE_WINDOW_MS = 15 * 60 * 1000;
 const SEEN_IDS_MAX = 500;
@@ -97,12 +106,16 @@ const STRANGERS_FILE = "strangers.json";
 const CONVERSATIONS_FILE = "conversations.json";
 const APPROVED_FILE = "approved.json";
 const PENDING_REPLIES_FILE = "pending-replies.json";
-const DELIVERABLE: ReadonlySet<Channel> = new Set(["imessage", "sms", "email", "a2a"]);
+const DELIVERABLE: ReadonlySet<Channel> = new Set(["imessage", "sms", "whatsapp", "email", "a2a"]);
 /** Channels where the sender's identity is bound to the carrier or the process, so an owner reply can settle an approval. */
-const APPROVAL_CHANNELS: ReadonlySet<Channel> = new Set(["imessage", "sms", "chat"]);
-const CHANNELS: ReadonlySet<string> = new Set(["imessage", "sms", "email", "a2a", "chat", "scheduled", "system"]);
+const APPROVAL_CHANNELS: ReadonlySet<Channel> = new Set(["imessage", "sms", "whatsapp", "chat"]);
+/** Phone text threads: where owner notices go when the owner last wrote from one. */
+const TEXT_THREADS: ReadonlySet<Channel> = new Set(["imessage", "sms", "whatsapp"]);
+const CHANNELS: ReadonlySet<string> = new Set(["imessage", "sms", "whatsapp", "email", "a2a", "chat", "scheduled", "system"]);
 const REPLY_TOOL = "reply_instinct";
 const PROCESSING_FILE = "processing-events.json";
+const CLAIM_ATTEMPTS_FILE = "owner-claim-attempts.json";
+const CARRIER_CHANNELS: ReadonlySet<Channel> = new Set(["imessage", "sms"]);
 
 /** Work may already have caused an external effect; automatic replay is not safe. */
 export class InboundUncertainError extends Error {
@@ -162,6 +175,8 @@ export class Conversation {
   replyRef: ReplyRef;
   /** Set when the model answered an A2A task itself during the current run. */
   repliedViaTool = false;
+  /** True while the current run was started by the owner's own direct message (see ToolContext.ownerTurn). */
+  ownerTurn = false;
   busy = false;
   private readonly sessionFile: string;
   private readonly refreshPrompt: () => string;
@@ -236,6 +251,13 @@ interface ConversationOpts {
 export class AgentRuntime {
   private readonly deps: RuntimeDeps;
   private readonly conversations = new Map<string, Conversation>();
+  /**
+   * The last bubble sent into each carrier thread, stamped with a send sequence number.
+   * A counter rather than a clock: "was this delivered after that text arrived" must not
+   * depend on two calls landing in different milliseconds.
+   */
+  private readonly lastDelivered = new Map<string, { text: string; seq: number }>();
+  private sendSeq = 0;
   private readonly now: () => Date;
   private readonly sessionsDir: string;
   private readonly notifier: OwnerNotifier;
@@ -253,7 +275,7 @@ export class AgentRuntime {
     deps.state.ensure();
     this.a2aStore = deps.a2aStore ?? new A2AStore(deps.state);
     const savedRoute = deps.state.readJson<{ conversationKey?: unknown; channel?: unknown }>("owner-route.json", {});
-    if (typeof savedRoute.conversationKey === "string" && ["imessage", "sms"].includes(String(savedRoute.channel))) {
+    if (typeof savedRoute.conversationKey === "string" && TEXT_THREADS.has(savedRoute.channel as Channel)) {
       this.ownerLast = { conversationKey: savedRoute.conversationKey, channel: savedRoute.channel as Channel };
     }
     this.notifier = new OwnerNotifier({
@@ -355,9 +377,10 @@ export class AgentRuntime {
     return conv;
   }
 
-  async handleInbound(msg: InboundMessage, opts: { waitForCompletion?: boolean } = {}): Promise<HandleResult> {
+  async handleInbound(incoming: InboundMessage, opts: { waitForCompletion?: boolean } = {}): Promise<HandleResult> {
+    let msg = incoming;
     const originalPrincipal = resolvePrincipal(msg, this.deps.config, this.deps.contacts);
-    const base = { principal: originalPrincipal, conversationKey: msg.conversationKey, acked: true as const };
+    let base = { principal: originalPrincipal, conversationKey: msg.conversationKey, acked: true as const };
     if (this.seenBefore(msg.id)) return { ...base, blocked: "duplicate" };
     if (msg.channel === "a2a" && msg.meta?.eventType === "a2a.task.canceled") {
       this.cancelA2A(msg);
@@ -366,6 +389,12 @@ export class AgentRuntime {
     }
     let run = this.inboundRuns.get(msg.id);
     if (!run) {
+      // Only a new, not-yet-seen message with a resolved 1:1 scope may claim the owner seat.
+      const claimed = this.maybeClaimOwner(msg);
+      if (claimed) {
+        msg = claimed;
+        base = { ...base, principal: resolvePrincipal(msg, this.deps.config, this.deps.contacts) };
+      }
       run = this.processInbound(msg);
       this.inboundRuns.set(msg.id, run);
       void run.finally(() => this.inboundRuns.delete(msg.id)).catch(() => undefined);
@@ -374,14 +403,66 @@ export class AgentRuntime {
     const outcome = await withinBudget(run.then((result) => ({ result }), (error: unknown) => ({ error })), this.deps.replyBudgetMs ?? DEFAULT_REPLY_BUDGET_MS);
     if (outcome.state !== "done") {
       this.backgroundReplies.add(msg.id);
+      // A carrier thread gets its texted "on it" from runInbound (ackSlowReplies), on every path.
       return { ...base, reply: ackText(msg.channel) };
     }
     if ("error" in outcome.value) throw outcome.value.error;
     return outcome.value.result;
   }
 
+  /**
+   * An agent handed out before its owner's phone was known (config.owner.claimOnFirstContact
+   * with no phones) adopts the first person who texts it 1:1 on a carrier channel a message
+   * containing the one-time claim code (owner-claim.ts). No valid code configured means no
+   * claim at all. Group threads, unresolved scopes, reactions, email and A2A never claim. A
+   * wrong code leaves the sender an ordinary stranger and does not use up the claim, but each
+   * number gets only MAX_CLAIM_ATTEMPTS tries. On success the phone is written to config.json,
+   * the flag and the code are cleared so they cannot be reused, and the returned message has
+   * the code stripped so it never reaches the model or the transcript.
+   */
+  private maybeClaimOwner(msg: InboundMessage): InboundMessage | undefined {
+    const { config, state, audit } = this.deps;
+    const owner = config.owner;
+    if (!owner.claimOnFirstContact || owner.phones.length > 0) return undefined;
+    if (msg.channel !== "imessage" && msg.channel !== "sms") return undefined;
+    if (msg.meta?.conversationScopeKnown !== true || isGroup(msg)) return undefined;
+    if (msg.meta?.reaction !== undefined) return undefined;
+    const from = (msg.from ?? "").trim();
+    if (!looksLikePhone(from)) return undefined;
+    const phone = normalizePhone(from);
+    if (!phone) return undefined;
+    const status = ownerClaimStatus(config, this.now());
+    if (!status.enabled) return undefined;
+    const attempts = state.readJson<Record<string, number>>(CLAIM_ATTEMPTS_FILE, {});
+    if ((attempts[phone] ?? 0) >= MAX_CLAIM_ATTEMPTS) return undefined;
+    const match = matchClaimCode(msg.text, status.code);
+    if (!match.matched) {
+      attempts[phone] = (attempts[phone] ?? 0) + 1;
+      state.writeJson(CLAIM_ATTEMPTS_FILE, attempts);
+      if (attempts[phone] === MAX_CLAIM_ATTEMPTS) {
+        audit.append({ kind: "policy", conversationKey: msg.conversationKey, principal: `stranger:${msg.channel}:${phone}`, detail: { ownerClaimLocked: true, channel: msg.channel, phone } });
+      }
+      return undefined;
+    }
+    owner.phones = [phone];
+    owner.claimOnFirstContact = false;
+    delete owner.claimCode;
+    delete owner.claimExpiresAt;
+    saveConfig(state, config);
+    state.writeJson(CLAIM_ATTEMPTS_FILE, {});
+    audit.append({
+      kind: "policy",
+      conversationKey: msg.conversationKey,
+      principal: "owner",
+      detail: { ownerClaimed: true, channel: msg.channel, phone },
+    });
+    return { ...msg, text: match.rest || CLAIM_WELCOME_TEXT };
+  }
+
   private async processInbound(original: InboundMessage): Promise<HandleResult> {
     if (original.meta?.conversationScopeKnown === false) throw new Error("Conversation scope must be resolved before delivery");
+    // Taken before any wait: a reply sent after this point was sent after this text arrived.
+    const arrivedSeq = this.sendSeq;
     const processing = this.deps.state.readJson<string[]>(PROCESSING_FILE, []);
     if (processing.includes(original.id)) throw new InboundUncertainError(original.id);
     const prepared = await this.prepareA2A(original);
@@ -391,13 +472,15 @@ export class AgentRuntime {
     }
     const { msg, principal, key } = prepared;
     const queueKey = key ?? runtimeKey(msg, principal ?? resolvePrincipal(msg, this.deps.config, this.deps.contacts));
+    // Waiting behind another message in the same conversation: that run already owns the "on it".
+    const queued = this.inboundQueues.has(queueKey);
     const before = this.inboundQueues.get(queueKey) ?? Promise.resolve();
     const work = before.catch(() => undefined).then(async () => {
       if (this.seenBefore(original.id)) return { acked: true as const, principal: principal ?? resolvePrincipal(msg, this.deps.config, this.deps.contacts), conversationKey: msg.conversationKey, blocked: "duplicate" };
       const active = this.deps.state.readJson<string[]>(PROCESSING_FILE, []);
       this.deps.state.writeJson(PROCESSING_FILE, [...active, original.id]);
       try {
-        const result = await this.runInbound(msg, principal, key);
+        const result = await this.runInbound(msg, principal, key, { arrivedSeq, queued });
         if (this.backgroundReplies.delete(original.id) && !DELIVERABLE.has(msg.channel) && result.reply) this.stash(queueKey, result.reply);
         this.markSeen(original.id);
         this.deps.state.writeJson(PROCESSING_FILE, this.deps.state.readJson<string[]>(PROCESSING_FILE, []).filter((id) => id !== original.id));
@@ -411,7 +494,7 @@ export class AgentRuntime {
     return work;
   }
 
-  private async runInbound(msg: InboundMessage, routedPrincipal?: Principal, routedKey?: string): Promise<HandleResult> {
+  private async runInbound(msg: InboundMessage, routedPrincipal: Principal | undefined, routedKey: string | undefined, arrival: { arrivedSeq: number; queued: boolean }): Promise<HandleResult> {
     const { audit, approvals, config, contacts, policy } = this.deps;
     const group = isGroup(msg);
     let principal = routedPrincipal ?? resolvePrincipal(msg, config, contacts);
@@ -483,14 +566,23 @@ export class AgentRuntime {
     }
 
     const promptedBefore = approvals.promptedToken();
-    const run = conv.run(prompt).then(
+    // Only a run the owner started with their own words may settle an approval through a tool.
+    conv.ownerTurn = principal.kind === "owner" && !group && !msg.meta?.delegatedResult && APPROVAL_CHANNELS.has(msg.channel);
+    const ack = this.startSlowReplyAck(msg, principal, group || arrival.queued || Boolean(msg.meta?.delegatedResult));
+    const run = conv.run(prompt).finally(() => {
+      conv.ownerTurn = false;
+    }).then(
       (reply) => ({ ok: true as const, reply }),
       (error: unknown) => ({ ok: false as const, error }),
     );
     const outcome = await run;
+    // The "on it" lands before the answer or not at all.
+    await ack.stop();
     const reply = this.replyText(outcome, principal);
     if (!outcome.ok) this.auditError(conv.key, principal, outcome.error);
-    if (DELIVERABLE.has(msg.channel) && reply) await this.deliver(conv, reply, { keepPrompt: approvals.promptedToken() !== promptedBefore });
+    if (DELIVERABLE.has(msg.channel) && reply) {
+      await this.deliver(conv, reply, { keepPrompt: approvals.promptedToken() !== promptedBefore, arrivedSeq: arrival.arrivedSeq, failure: !outcome.ok });
+    }
     return { ...base, acked: true, reply: joinReply(reply) };
   }
 
@@ -509,6 +601,29 @@ export class AgentRuntime {
     }
     if (!text.trim()) return;
     await this.sendToOwner(text, principal, key);
+  }
+
+  /**
+   * A task the operator asked for (a `system.task` envelope): runs as the owner in
+   * its own conversation. The result goes to the owner's phone unless the task is
+   * quiet, in which case only its side effects (memory, schedules) remain. Like a
+   * scheduled job, the owner did not write the prompt, so ownerTurn stays false and
+   * approval_settle is refused inside it.
+   */
+  async runSystemTask(task: { id: string; name?: string; prompt: string; quiet?: boolean }): Promise<string> {
+    const principal = this.ownerPrincipal();
+    const key = `system:${task.id}`;
+    const conv = this.conversation(key, principal);
+    this.deps.audit.append({ kind: "schedule", conversationKey: key, principal: principal.id, detail: { systemTask: task.id, name: task.name, quiet: task.quiet === true } });
+    let text = "";
+    try {
+      text = await conv.run(task.prompt);
+    } catch (error) {
+      this.auditError(key, principal, error);
+      throw error;
+    }
+    if (!task.quiet && text.trim()) await this.sendToOwner(text, principal, key);
+    return text;
   }
 
   // -------------------------------------------------------------------------
@@ -691,7 +806,7 @@ export class AgentRuntime {
     if (preview) detail.result = preview;
     audit.append({ kind: "tool_call", conversationKey: conv.key, principal: conv.principal.id, detail });
     if (toolName === REPLY_TOOL && !isError) conv.repliedViaTool = true;
-    if (isError) return;
+    if (isError || meta?.recordsOwnSpend) return;
     const amountUsd = meta?.amountUsd?.(args);
     const spends = meta?.capabilities.some((c) => SPEND_CAPABILITIES.has(c)) ?? false;
     if ((amountUsd !== undefined && amountUsd > 0) || spends) {
@@ -718,17 +833,24 @@ export class AgentRuntime {
     const verb = match.approved ? "approved" : "denied";
     audit.append({ kind: "approval", conversationKey: resolved.conversationKey, principal: principal.id, detail: { token: resolved.token, status: resolved.status, summary: resolved.summary } });
 
-    // A relay approval (ask_owner) informs the model through the follow-up only; it never
-    // pre-authorises a policy ask.
-    if (match.approved && resolved.capability !== "owner.relay") this.rememberApproved(resolved);
-
     const note = `${match.approved ? "Approved" : "Denied"}: ${resolved.summary}`;
-    await this.resumeConversation(resolved.conversationKey, `Owner ${verb}: ${resolved.summary}`);
+    await this.afterApproval(resolved, match.approved);
 
     if (DELIVERABLE.has(msg.channel)) {
       await this.safeSend({ channel: msg.channel as OutboundChannel, conversationKey: msg.conversationKey, text: note, replyRef: msg.replyRef }, principal, msg.conversationKey);
     }
     return note;
+  }
+
+  /**
+   * What happens once an approval is settled, whether by a yes/no text or by the
+   * approval_settle tool: remember a policy grant, then wake the conversation that
+   * asked. A relay approval (ask_owner) informs the model through the follow-up only;
+   * it never pre-authorises a policy ask.
+   */
+  async afterApproval(approval: Approval, approved: boolean): Promise<void> {
+    if (approved && approval.capability !== "owner.relay") this.rememberApproved(approval);
+    await this.resumeConversation(approval.conversationKey, `Owner ${approved ? "approved" : "denied"}: ${approval.summary}`);
   }
 
   /** Wake the conversation that was waiting on the owner. Busy: queue. Idle: run and deliver. */
@@ -759,7 +881,7 @@ export class AgentRuntime {
    * its text is stashed for the next turn. A2A replies carry the task id and say "progress"
    * while an approval is pending, and are skipped when the model already answered itself.
    */
-  private async deliver(conv: Conversation, text: string, opts: { keepPrompt?: boolean } = {}): Promise<void> {
+  private async deliver(conv: Conversation, text: string, opts: { keepPrompt?: boolean; arrivedSeq?: number; failure?: boolean } = {}): Promise<void> {
     const channel = conv.channel;
     if (channel === "scheduled" || channel === "system") return;
     if (!DELIVERABLE.has(channel)) {
@@ -779,10 +901,67 @@ export class AgentRuntime {
       const waiting = this.deps.approvals.pending().some((a) => a.conversationKey === conv.key);
       out.a2a = { taskId, intent: waiting ? "progress" : "complete" };
     }
+    if (this.duplicateOfQueuedReply(conv, text, opts)) {
+      this.deps.audit.append({ kind: "outbound", conversationKey: conv.key, principal: conv.principal.id, detail: { channel, skipped: "duplicate reply", chars: text.length } });
+      return;
+    }
     // A reply to the owner changes what their next bare "yes" is about, unless this run raised the question.
     if (conv.principal.kind === "owner" && !opts.keepPrompt) this.deps.approvals.clearPrompted();
     await this.safeSend(out, conv.principal, conv.key);
     if (out.a2a && out.a2a.intent === "complete") this.a2aStore.recordTask({ taskId: out.a2a.taskId, state: "completed" });
+  }
+
+  /**
+   * Several texts sent while one answer was being written are each run in turn, and the
+   * later runs often end on that same answer. Only that echo is dropped: the reply repeats
+   * the last bubble in the thread word for word, and the text that produced it arrived
+   * before that bubble went out. A later request that happens to get the same answer
+   * ("Done.") is news, a failure line is always worth repeating, and a shared thread is
+   * never deduplicated because the same words may be for a different person.
+   */
+  private duplicateOfQueuedReply(conv: Conversation, text: string, opts: { arrivedSeq?: number; failure?: boolean }): boolean {
+    if (!CARRIER_CHANNELS.has(conv.channel) || opts.failure || opts.arrivedSeq === undefined) return false;
+    if (conv.key !== conv.deliveryKey) return false;
+    const last = this.lastDelivered.get(conv.deliveryKey);
+    return last !== undefined && last.text === text && last.seq > opts.arrivedSeq;
+  }
+
+  /**
+   * With features.ackSlowReplies, an owner's own 1:1 text that is still running after the
+   * reply budget gets one "on it" bubble. Never for a queued or steered text (the run in
+   * front owns the thread), a group, or a run that already put something in the thread.
+   * stop() cancels a pending ack and waits for one already sending, so it lands first.
+   */
+  private startSlowReplyAck(msg: InboundMessage, principal: Principal, skip: boolean): { stop: () => Promise<void> } {
+    const eligible = this.deps.config.features.ackSlowReplies === true && CARRIER_CHANNELS.has(msg.channel) && principal.kind === "owner" && !skip;
+    if (!eligible) return { stop: async () => undefined };
+    const thread = msg.conversationKey;
+    const startSeq = this.sendSeq;
+    let sending: Promise<unknown> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+      timer = undefined;
+      if ((this.lastDelivered.get(thread)?.seq ?? -1) > startSeq) return;
+      sending = this.safeSend({ channel: msg.channel as OutboundChannel, conversationKey: thread, text: ackText(msg.channel), replyRef: msg.replyRef }, principal, thread).catch(() => undefined);
+    }, this.deps.replyBudgetMs ?? DEFAULT_REPLY_BUDGET_MS);
+    return {
+      stop: async () => {
+        if (timer) clearTimeout(timer);
+        timer = undefined;
+        if (sending) await sending;
+      },
+    };
+  }
+
+  /**
+   * For the server's own owner-facing texts (a finished phone call, for example): the same
+   * route as the runtime's messages. False when there is no way to reach the owner.
+   */
+  async relayToOwner(text: string, originKey: string, opts: { approvalToken?: string } = {}): Promise<boolean> {
+    const last = this.ownerLast;
+    const reachable = Boolean(this.deps.config.owner.phones[0]) || Boolean(last && DELIVERABLE.has(last.channel) && last.channel !== "a2a");
+    if (!reachable) return false;
+    await this.sendToOwner(text, this.ownerPrincipal(), originKey, opts);
+    return true;
   }
 
   /**
@@ -793,8 +972,8 @@ export class AgentRuntime {
     const last = this.ownerLast;
     const phone = this.deps.config.owner.phones[0];
     let out: OutboundMessage;
-    if (last && (last.channel === "imessage" || last.channel === "sms")) {
-      out = { channel: last.channel, conversationKey: last.conversationKey, text };
+    if (last && TEXT_THREADS.has(last.channel)) {
+      out = { channel: last.channel as OutboundChannel, conversationKey: last.conversationKey, text };
     } else if (phone) {
       out = { channel: "imessage", to: phone, text };
     } else if (last && DELIVERABLE.has(last.channel) && last.channel !== "a2a") {
@@ -812,6 +991,8 @@ export class AgentRuntime {
   private async safeSend(out: OutboundMessage, principal: Principal, conversationKey: string): Promise<boolean> {
     try {
       await this.deps.outbox.send(out, { principal, conversationKey });
+      // Recorded only once the carrier took it: a failed send must not suppress the retry.
+      if (CARRIER_CHANNELS.has(out.channel) && out.conversationKey) this.lastDelivered.set(out.conversationKey, { text: out.text, seq: ++this.sendSeq });
       this.deps.audit.append({ kind: "outbound", conversationKey, principal: principal.id, detail: { channel: out.channel, to: out.to, conversationKey: out.conversationKey, chars: out.text.length } });
       return true;
     } catch (error) {
@@ -822,7 +1003,11 @@ export class AgentRuntime {
 
   private replyText(value: { ok: true; reply: string } | { ok: false; error: unknown }, principal: Principal): string {
     if (value.ok) return value.reply;
-    if (principal.kind === "owner") return `Something went wrong: ${errorMessage(value.error)}`;
+    // The full detail is in the audit log (auditError); the owner gets a short human reason, never a JSON body.
+    if (principal.kind === "owner") {
+      const reason = shortReason(errorMessage(value.error));
+      return `Hit a snag on my end${reason ? ` (${reason})` : ""}. Give me a minute and try that again.`;
+    }
     return "Sorry, I hit a problem. Please try again later.";
   }
 
@@ -855,7 +1040,7 @@ export class AgentRuntime {
       // Read fresh each time so `instinct persona set` applies on the next message.
       persona: readPersona(state),
       instructions: readAgentsInstructions(state),
-      skillsPrompt,
+      skillsPrompt: typeof skillsPrompt === "function" ? skillsPrompt(principal) : skillsPrompt,
       pendingApprovals: pending,
       setup: this.deps.setupSummary?.(),
       extra,
@@ -892,6 +1077,7 @@ export class AgentRuntime {
         if (conv.replyRef.taskId) this.a2aStore.recordTask({ taskId: conv.replyRef.taskId, state });
       },
       channel: conv.channel,
+      get ownerTurn() { return conv.ownerTurn; },
       now: this.now,
     };
     const visible = (t: RegisteredTool) => t.spec.meta.capabilities.every((c) => policy.canEver(conv.principal, c));
@@ -1075,10 +1261,14 @@ export function writeSession(file: string, messages: AgentMessage[]): void {
  * no more than SESSION_KEEP_CHARS of JSON) and fold everything older into one plain-text
  * summary message. Idempotent on an already folded transcript.
  */
-export function restoreMessages(stored: AgentMessage[], now: Date, keep = SESSION_KEEP_MESSAGES, maxChars = SESSION_KEEP_CHARS): AgentMessage[] {
-  const messages = dropOrphanToolCalls(stored.filter((m) => m.role !== "system"));
+export function restoreMessages(stored: AgentMessage[], now: Date, keep = SESSION_KEEP_MESSAGES, maxChars = SESSION_KEEP_CHARS, keepImages = KEEP_RECENT_IMAGES): AgentMessage[] {
+  // Results first: a call is judged only against results that survive, so an orphan result
+  // about to be dropped cannot leave its same-id call standing without an answer.
+  const messages = dropOldImages(dropOrphanToolCalls(dropOrphanToolResults(stored.filter((m) => m.role !== "system"))), keepImages);
   let start = messages.length <= keep ? 0 : nextUserTurn(messages, messages.length - keep);
-  // Large tool results can blow the context long before the message count does.
+  // Large tool results can blow the context long before the message count does. The slice
+  // only ever moves to a user or assistant turn; when none is left it stays where it is,
+  // even above budget, because a slice that starts at a tool result is rejected outright.
   while (start < messages.length - 1 && charSize(messages.slice(start)) > maxChars) {
     const next = nextUserTurn(messages, start + 1);
     if (next >= messages.length || next === start) break;
@@ -1106,11 +1296,39 @@ export function trimContext(messages: AgentMessage[], now: Date): AgentMessage[]
   return system.length ? [...system, ...rest] : rest;
 }
 
-/** The kept slice must begin at a user turn so no tool result is left without its call. */
+/**
+ * The kept slice must begin at a user turn so no tool result is left without its call. A
+ * long tool loop (a browser session: screenshot, click, screenshot...) can run past the
+ * window with no user turn at all; then the slice begins at the next assistant turn, which
+ * the API also accepts, and never at a tool result, which it rejects. With nothing left to
+ * land on this returns the end, and the caller keeps the slice where it is.
+ */
 function nextUserTurn(messages: AgentMessage[], from: number): number {
   let i = from;
   while (i < messages.length && messages[i]?.role !== "user") i++;
-  return i >= messages.length ? from : i;
+  if (i < messages.length) return i;
+  let a = from;
+  while (a < messages.length && messages[a]?.role !== "assistant") a++;
+  return a;
+}
+
+/**
+ * A screenshot is a few hundred thousand characters of base64, more than the whole char
+ * budget, so a browser session would push the fold past every turn in one step. Older
+ * screenshots are swapped for a one-line placeholder; the newest few stay, since the model
+ * is looking at them. The text parts of the result are untouched.
+ */
+export function dropOldImages(messages: AgentMessage[], keepImages = KEEP_RECENT_IMAGES): AgentMessage[] {
+  let seen = 0;
+  const out = messages.slice();
+  for (let i = out.length - 1; i >= 0; i--) {
+    const m = out[i]!;
+    if (m.role !== "toolResult" || !m.content.some((c) => c.type === "image")) continue;
+    seen++;
+    if (seen <= keepImages) continue;
+    out[i] = { ...m, content: m.content.map((c) => (c.type === "image" ? { type: "text" as const, text: "(an earlier screenshot, dropped to save space)" } : c)) };
+  }
+  return out;
 }
 
 function charSize(messages: AgentMessage[]): number {
@@ -1123,6 +1341,22 @@ function charSize(messages: AgentMessage[]): number {
     }
   }
   return total;
+}
+
+/**
+ * Drop tool results whose call is not earlier in the transcript. A session saved by a fold
+ * that cut inside a turn (before the fold learned to land only on a turn) starts like that,
+ * and every later run of that conversation is rejected until it is repaired.
+ */
+function dropOrphanToolResults(messages: AgentMessage[]): AgentMessage[] {
+  const calls = new Set<string>();
+  const out: AgentMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "assistant") for (const c of m.content) if (c.type === "toolCall") calls.add(c.id);
+    if (m.role === "toolResult" && !calls.has(m.toolCallId)) continue;
+    out.push(m);
+  }
+  return out;
 }
 
 function dropOrphanToolCalls(messages: AgentMessage[]): AgentMessage[] {
@@ -1237,6 +1471,14 @@ export function stableJson(value: unknown): string {
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`).join(",")}}`;
 }
 
+/** The part of an error a person can use: no JSON bodies, no status-code prefixes, one short line. */
+export function shortReason(message: string): string {
+  let m = message.split(/[{\n]/)[0] ?? "";
+  m = m.replace(/^\s*\d{3}:?\s*/, "").replace(/[:\s]+$/, "").trim();
+  if (m.length > 80) m = `${m.slice(0, 77).trim()}...`;
+  return m;
+}
+
 export function hashArgs(args: unknown): string {
   return createHash("sha256").update(stableJson(args ?? {})).digest("hex").slice(0, 16);
 }
@@ -1244,7 +1486,11 @@ export function hashArgs(args: unknown): string {
 function approvalText(approval: Approval, requester: Principal, config: InstinctConfig): string {
   const who = requester.kind === "owner" ? "" : ` (asked by ${requester.displayName})`;
   const amount = approval.amountUsd !== undefined ? ` ($${approval.amountUsd.toFixed(2)})` : "";
-  return `${approval.summary}${amount}${who}. Reply YES or NO. Token ${approval.token}. From ${config.agent.name}.`;
+  // A plain question, no token and no protocol words: a bare yes or no settles it, anything else the model settles.
+  // Policy prompts may already end with the question; strip it so it is asked exactly once.
+  void config;
+  const base = approval.summary.replace(/[\s.?!]*want me to go ahead\?\s*$/i, "").replace(/[\s.?!]+$/, "");
+  return `${base}${amount}${who}. Want me to go ahead?`;
 }
 
 function untrustedLabel(msg: InboundMessage, principal: Principal): string {
